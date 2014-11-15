@@ -65,7 +65,7 @@ Many levels of consistency and ordering are possible depending on need an produc
     Eventual           | Writers block on 1-Replica | Process single messages
 	Consistency        | commit                     |
 
-###Multi-Key Transactions and Failover
+###Multi-Node Durable Transactions and Failover
 
 We want to support multi-node durability N, such that N-1 replica nodes can fail and all messages are still safely held. N is the replication factor. We do this by assigning a node to be the write/production master, a node to be the read/consumer master, and flow delivery serially from write to any number of intermediate nodes before reaching the read master.
 
