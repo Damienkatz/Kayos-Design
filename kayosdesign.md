@@ -4,13 +4,13 @@
 
 Build a fast, low cost, fault tolerant messaging and queueing system that offers predictable performance and can take advantage of high end dedicated hardware as well as unreliable, commodity infrastructure like EC2. We want to support message de-duplication (newer versions of messages eliminate older versions) while also maintaining strict consistency (ordered synchronous delivery), causal consistency (ordered asynchronous delivery) and eventual consistency (unordered asynchonous delivery).
 
-Low cost means we should use data locality, batching and caching strategies to make efficient use of RAM, CPU, storage IO and network IO on contemporary systems, reducing the total number of machines and resources necessary.
+Low cost means deployable on clusters of unreliable commodity hardware and also using strategies for data locality, batching and caching to make efficient use of RAM, CPU, storage IO and network IO reducing the total number of machines and resources necessary.
 
-Fault tolerant means machines and networks can become unhealthy (slow or unresponsive) and the system can move and remove resources to regain health and also be able to quickly add new nodes to increase capacity. Recovering failed nodes and initializing new nodes should be fast and efficient. The worst time to burden the cluster with a heavy load is when adding in additional capacity, either due to replacing old nodes or just adapting to heavier traffic.
+Fault tolerant means machines and networks can become unhealthy (slow or unresponsive) and the system can move and remove resources to regain health and also be able to quickly add new nodes to increase capacity. Recovering failed nodes and initializing new nodes should be fast and efficient. The worst time to overload the cluster is when adding in additional capacity, either due to replacing old nodes or just adapting to heavier traffic.
 
 We want strong ordering and durability guarantees, to allow the easy connection to variety of consuming systems and to be able to easily reason about capabilities and semantics under both normal operating conditions and chaotic failure modes.
 
-The deployment use case is to become an ingestion point for large amounts data generated that needs to be delivered to multiple disparate systems, such as large web scale web sites with millions of users or the internet of things that is constantly generating data to be processed. The system becomes a buffer, to accommodate realtime systems (Key/Value caching and stream analytics) as well as batch oriented (data warehousing, deep analytics) and systems between the two extremes, like RDBMSs and fulltext/search indexing.
+The deployment use case is to become an ingestion point for large amounts data generated that needs to be delivered to multiple disparate systems, such as large scale web sites or the internet of things that is constantly generating data to be processed. The system becomes a buffer, to accommodate realtime systems (Key/Value caching and stream analytics) as well as batch oriented (data warehousing, deep analytics) and systems between the two extremes, like RDBMSs and fulltext/search indexing.
 
 Here will go over a non-sharded design that offers global ordered consistency, that can serve of the basis for a horizontally scalable queueing systems where only partially consistency is required.
 
@@ -32,7 +32,7 @@ The supporting data structure is a Copy-On-Write (COW) Btree, which gives us O(l
 
 [need diagrams here displaying the sequence index updated atomically with message de-duplication]
 
-However this means messages are effectively reordered, breaking message ordering and potentially consistency. But consumers can still preserve strict consistency if they can commit to their representation in an isolated atomic commit. We make this possible by sending the consumers boundary markers that indicate the end of their current MVCC queue snapshot, and the consumers commit the processed messages into there representation in an atomic transaction, bringing itself into ordered consistency.
+However this means message keys are effectively reordered, breaking message ordering and potentially consistency. But consumers can still preserve strict consistency if they can commit to their representation in an isolated atomic commit. We make this possible by sending the consumers boundary markers that indicate the end of their current MVCC queue snapshot, and the consumers commit the processed messages into there representation in an atomic transaction, bringing itself into ordered consistency.
 
 For replication, replica Kayos servers are symmetric with consumers, each downstream replica is really just a consumer of it's upstream replica. Replication can be both use chained and fanout replication. Chained to increase redundancy, and fanout to also increase consumer client capacity.
 
@@ -91,9 +91,9 @@ For Fanout, we might look like this:
 			             			 -> Node C3 -> Consumer(s)
 									 
 
-Producers who need N factor replication before returning success will write to Node A and get success response and get back the assigned sequence number S. The producer can then take that sequence number S and poll a C node, waiting until C has committed or seen that sequence or higher. Once it gets back success, the client knows it's messages are N replica safe.
+Producers who need N-factor replication before returning success will write to Node A and get success response with the new assigned sequence number. The producer can then take that sequence number and poll a C node, waiting until C has committed or seen that sequence or higher. Once it gets back success, the client knows it's messages are N replica safe.
 
-Because consumers are only ever listening on C nodes, they will never have a partially consumed message (where a message is only consumed by some consumers, instead of all consumers) due to replica loss. Any N-1 replica's can be lost before data is lost or inconsistency is possible.
+Because consumers are only ever listening on C nodes, the system can suffer N-1 replica loss and the system will never suffer a partially consumed message (where a message is only consumed by some consumers, instead of all consumers). Any N-1 replica's can be lost before data is lost or inconsistency is possible.
 
 To ensure a message is _durably written_ on M nodes (where M is <= replication factor N) before the message is visible, the replication of a message can be blocked on each each node (M - 1) hops from a consumer, but the consequence is all messages written after it will also be blocked until that message is durable, to preserve sequence ordering.
 
@@ -157,13 +157,14 @@ The durability engine used is Couchstore, a storage engine written in C and used
 
 Both Couchstore and ForestDB have unique properties directly suitable for a message queue:
 
-* Sequential Write IO. It's file format is a hybrid of a transaction log and storage engine. All updates are tail append, including meta data and COW B-Tree nodes. For SSDs this minimizes write amplification, for HDDs this minimizes seek operations.
+* Sequential Write IO: It's file format is a hybrid of a transaction log and storage engine. All updates are tail append, including meta data and COW B-Tree nodes. For SSDs this minimizes write amplification, for HDDs this minimizes seek operations.
+* Sequential Read IO: It's file format is a hybrid of a transaction log and storage engine. All updates are tail append, including meta data and COW B-Tree nodes. For SSDs this minimizes write amplification, for HDDs this minimizes seek operations.
 * Fast Durability: All commits (inserts/updates/deletes) are batched and made durable with a single fsync of sequential writes. This includes all data, metadata, and control structures (btree nodes, etc). If a crash or power loss happens during a commit attempt, the uncommitted bytes just appear as garbage at the end of the file
-* ACID: Updates aren't visible until safely committed. Offers strict ordering consistency for individual and bulk commits.
-* MVCC snapshotting: The COW btree's and headers allow concurrent updates while any number of open snapshots operating on different versions of the queue state, simplifying the correct operational behavior or consumers and produces without requiring locks. 
-* Pauseless compaction: When the storage file exceeds a garbage threshold, all live, unexpired data is copied into a new storage file, giving optimized locality and balancing of btrees, until caught up with main storage, which is then swapped out for the new file.
+* ACID: Updates aren't visible until safely durable. Offers strict ordering consistency for individual and bulk commits.
+* MVCC snapshotting: The COW btree's and headers allow concurrent updates while any number of open snapshots operating on previous versions of the queue state, simplifying the correct operational behavior of consumers and producers without requiring locks. 
+* Pauseless compaction: When the storage file exceeds a garbage threshold, all live, unexpired data is copied into a new storage file, making all messages sequential and producing optimal locality and balancing of btrees. Current mutations copied until the compacted file is caught up with main file, which is then swapped out for the newly compacted file.
 
-The storage technology is uniquely designed for streaming and de-duplicating data and battle proven, originally created for CouchDB, then enhanced and optimized for Couchbase.
+The storage technology is uniquely designed for streaming and de-duplicating data and is battle proven at some of the largest, most heavily used websites.
 
 
 ##Conclusion
