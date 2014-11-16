@@ -18,7 +18,7 @@ Here will go over a non-sharded design that offers global ordered consistency, t
 
 ###De-duplication, Scheduling and Fairness
 
-We want consumers to see messages in the order they are sent, but we also want the ability to revise messages with a new version. If messages are keyed, then any subsequent messages with the same key will overwrite previous messages, which is effectively key de-duplication. This means a consumer only has to see the most recent revision of a message, not every message version, and if a consumer has been disconnected from a long time makes it easier to catch up without the excessive work of processing every revision of every key.
+We want consumers to see messages in the order they are sent, but we also want the ability to revise messages with a new version. If messages are keyed, then any subsequent messages with the same key will overwrite previous messages, which is effectively key de-duplication. This means a consumer only has to see the most recent revision of a message, not every message version, and if a consumer has been disconnected for a long time, it can catch up without the excessive work of processing every revision of every key.
 
 This can accomplished by:
 
@@ -34,7 +34,7 @@ The supporting data structure is a Copy-On-Write (COW) Btree, which gives us O(l
 
 However this means message keys are effectively reordered, breaking message ordering and potentially consistency. But consumers can still preserve strict consistency if they can commit to their representation in an isolated atomic commit. We make this possible by sending the consumers boundary markers that indicate the end of their current MVCC queue snapshot, and the consumers commit the processed messages into there representation in an atomic transaction, bringing itself into ordered consistency.
 
-For replication, replica Kayos servers are symmetric with consumers, each downstream replica is really just a consumer of it's upstream replica. Replication can be both use chained and fanout replication. Chained to increase redundancy, and fanout to also increase consumer client capacity.
+For redundancy, replica Kayos servers are symmetric with consumers, each downstream replica is really just a consumer of it's upstream replica. Message routing can both use chained and fanout replication. Chained to increase redundancy, and fanout to also increase consumer client capacity.
 
 We also want to allow each consumer to proceed at it's own pace, not blocking other consumers and not using resources when inactive. Each consumer should be a lightweight addition to the master, we should be able to support a large number on consumers, concurrently or serially active, serially and any mix of the two. Each consumer will process a MVCC snapshot, and each consumer can have different snapshots with little additional overhead.
 
@@ -79,8 +79,7 @@ All producers connect and write to node A. All writes at A flow through to B, wh
 
 Message flow looks like this:
 
-    Producer(s) -> Node A -> Node B -> Node C -> Consumer(s)
-	                      
+    Producer(s) -> Node A -> Node B -> Node C -> Consumer(s)	                      
 
 For Fanout, we might look like this:
 
@@ -89,7 +88,7 @@ For Fanout, we might look like this:
 	Producer(s) -> Node A -> Node B ->  Node C2 -> Consumer(s)
                	                    |
 			             			 -> Node C3 -> Consumer(s)
-									 
+
 
 Producers who need N-factor replication before returning success will write to Node A and get success response with the new assigned sequence number. The producer can then take that sequence number and poll a C node, waiting until C has committed or seen that sequence or higher. Once it gets back success, the client knows it's messages are N replica safe.
 
@@ -99,11 +98,13 @@ To ensure a message is _durably written_ on M nodes (where M is <= replication f
 
 To increase message production capacity, multiple independent virtual shards (S1, S2, S3), of the queue will need to be created. A physical nodes can be a mix of write, intermediate or read nodes to smooth out capacity (to avoid "lumpiness" of durable data or messaging load), but the role of each node must be exclusive per shard.
 
-Example topology of a 3 shard, triple replicated queue:
+Example topology of a 3 shard, triple replicated queue using 3 physical node (A, B, C):
 
-    Shard S1: Producer(s) -> Node A -> Node B -> Node C -> Consumer(s)
-    Shard S2: Producer(s) -> Node B -> Node C -> Node A -> Consumer(s)
-	Shard S3: Producer(s) -> Node C -> Node A -> Node B -> Consumer(s)
+    Shard 1: Producer(s) -> Node A -> Node B -> Node C -> Consumer(s)
+	
+    Shard 2: Producer(s) -> Node B -> Node C -> Node A -> Consumer(s)
+	
+	Shard 3: Producer(s) -> Node C -> Node A -> Node B -> Consumer(s)
 
 Such a topology means casual ordering between shards is not possible.
 
@@ -124,19 +125,18 @@ When machine topologies change, it's possible for replica's to have divergent up
 
 Using a failover table, which is a list of master writer identifiers (UUIDs) mapped to the sequence a node became the master, and is generated after each startup thereafter, recording the new UUID and current sequence number.
 
-This is failover table to for the first initialized master, it generates a UUID and adds it into the takeover table at sequence 0.
+This is failover table to for the first initialized master, it generates a UUID and adds it into the table at sequence 0:
 
     Master ID     | Takeover Seq
 	_____________________________
 	0xDEADBEEF... | 0
 
-Then 3000 messages are sent, and then the node restarted. On restart, it no it generates a new master UUID and adds the current high sequence to the takeover tableL
+Then 3000 messages are sent, and then the node restarted. On restart, it generates a new master UUID and adds the current high sequence to the takeover table:
 
     Master ID     | Takeover Seq
 	_____________________________
 	0xDEADBEEF... | 0
 	0xCAFEBABE... | 3000
-
 
 
 So let's say we are a downstream replica node. As a downstream replica, when we connect to the upstream replica we retrieve the failover table from the compares it with our own, and find the common master ID between them. We will then rollback all changes to the sequence of the next newest entry, if it exists otherwise there is no sequence branch. If no common master is found, it completely resets it's storage.
@@ -150,6 +150,12 @@ To rollback storage and get caught back up to master, we:
 5. We copy the failover table from the master into our store.
 
 If all the steps succeed, we are casually consistent with master and can start receiving from upstream normally, and send them downstream or to consumers.
+
+###Registered Consumers and High Water Marks
+
+To prevent messages from being deleted before all consumers have received them, each consumer registers a High Water Mark (HWM) record, that indicate the highest sequence the consumer has processed. When compacting the durable message store, any message lower than the 
+
+###End to End Consistency Example
 
 ###Storage Engine
 
