@@ -158,7 +158,7 @@ The durability engine used is Couchstore, a storage engine written in C and used
 Both Couchstore and ForestDB have unique properties directly suitable for a message queue:
 
 * Sequential Write IO: It's file format is a hybrid of a transaction log and storage engine. All updates are tail append, including meta data and COW B-Tree nodes. For SSDs this minimizes write amplification, for HDDs this minimizes seek operations.
-* Sequential Read IO: Messages are also consumed in the same order the lay on disk, giving consumers nice sequential IO and can benefit from read ahead. Obsoleted messages and control structures are skipped over.
+* Sequential Read IO: Messages are also consumed in the same order they lay on disk, giving consumers nice sequential IO and can benefit from read ahead. Obsoleted messages and control structures are skipped over.
 * Fast Durability: All commits (inserts/updates/deletes) are batched and made durable with a single fsync of sequential writes. This includes all data, metadata, and control structures (btree nodes, etc). If a crash or power loss happens during a commit attempt, the uncommitted bytes just appear as garbage at the end of the file
 * ACID: Updates aren't visible until safely durable. Offers strict ordering consistency for individual and bulk commits.
 * MVCC snapshotting: The COW btree's and headers allow concurrent updates while any number of open snapshots operating on previous versions of the queue state, simplifying the correct operational behavior of consumers and producers without requiring locks. 
