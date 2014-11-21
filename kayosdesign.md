@@ -2,7 +2,7 @@
 
 ##Goal
 
-Build a fast, low cost, fault tolerant messaging and queueing system that offers predictable performance and can take advantage of high end dedicated hardware as well as unreliable, commodity infrastructure like EC2. We want to support message de-duplication (newer versions of messages eliminate older versions) while also maintaining strict consistency (ordered synchronous delivery), causal consistency (ordered asynchronous delivery) and eventual consistency (unordered asynchonous delivery).
+Build a fast, low cost, fault tolerant messaging and durable queueing system that offers predictable performance and can take advantage of high end dedicated hardware as well as unreliable, commodity infrastructure like EC2. We want to support message de-duplication (newer versions of messages eliminate older versions) while also maintaining strict consistency (ordered synchronous delivery), causal consistency (ordered asynchronous delivery) and eventual consistency (unordered asynchronous delivery).
 
 Low cost means deployable on clusters of unreliable commodity hardware and also using strategies for data locality, batching and caching to make efficient use of RAM, CPU, storage IO and network IO reducing the total number of machines and resources necessary.
 
@@ -10,9 +10,15 @@ Fault tolerant means machines and networks can become unhealthy (slow or unrespo
 
 We want strong ordering and durability guarantees, to allow the easy connection to variety of consuming systems and to be able to easily reason about capabilities and semantics under both normal operating conditions and chaotic failure modes.
 
-The deployment use case is to become an ingestion point for large amounts data generated that needs to be delivered to multiple disparate systems, such as large scale web sites or the internet of things that is constantly generating data to be processed. The system becomes a buffer, to accommodate realtime systems (Key/Value caching and stream analytics) as well as batch oriented (data warehousing, deep analytics) and systems between the two extremes, like RDBMSs and fulltext/search indexing.
+We wait for one or more producers sending messages intended for 0 or more consumers. (Zero means there is no consumer yet, but might in the future). The system is meant to provide "once or more" message delivery, meaning a message must be delivered at least once by each consumer, but failure condition and revisions can cause it to be delivered multiple times. As such it is meant strictly for messages that are idempotent.
 
-Here will go over a non-sharded design that offers global ordered consistency, that can serve of the basis for a horizontally scalable queueing systems where only partially consistency is required.
+The deployment use case is to become an ingestion point for large amounts data generated that needs to be delivered to multiple disparate systems, such as large scale web sites or the "internet of things" that is constantly generating sensor data to be processed. The system becomes a buffer, to accommodate realtime systems (Key/Value caching and stream analytics) as well as batch oriented (data warehousing, deep analytics) and systems between the two extremes, like RDBMSs and fulltext/search indexing.
+
+Here will go over a non-sharded design that gives global ordering, but is limited to performance capacities of on a single machine. This design can serve of the basis for a sharded, horizontally scalable queueing systems where only partial ordering consistency is required, but that's beyond the scope of this paper.
+
+###Previous Work
+
+This design is based on the Couchbase 3.0 Database Change Protocol.
 
 ##Technology
 
@@ -50,20 +56,27 @@ Applications that need to ensure not just message ordering, but need inter-messa
 
 ###Tunable Consistency
 
-Many levels of consistency and ordering are possible depending on need an production and consumers behaviors.
+Many levels of consistency and ordering are possible depending on need an production and consumers behaviors. 
+
+When consumers want N-Replica durability, they write the messages in a transaction to our producer/writer server. If the write is successful, we send to the producer client the master writer Id and the high sequence number in the transaction.
+
+The producer client can then wait for the values to be processed by the consumer by registering a 
+
 
     Desired Behavior   | Producers Must             | Consumers Must
     ___________________________________________________________________________
+    Strict Consistency | Blocked on all-or-nothing, | Process entire snapshots
+                       | until consumer named HWM   | then set HWM.
+                       | advances                   |
+    ___________________________________________________________________________
     Global Causal      | Blocked on all-or-nothing, | Process entire snapshots
-	Consistency        | N-Replica commits          |
+    Consistency        | N-Replica commits          |
     ___________________________________________________________________________
-					   
     Single Key Causal  | writers blocked on         | Process single messages
-	Consitency         | N-Replica commits          |
+    Consitency         | N-Replica commits          |
     ___________________________________________________________________________
-	
     Eventual           | Writers block on 1-Replica | Process single messages
-	Consistency        | commit                     |
+    Consistency        | commit                     |
 
 ###Multi-Node Durable Transactions and Failover
 
@@ -79,15 +92,15 @@ All producers connect and write to node A. All writes at A flow through to B, wh
 
 Message flow looks like this:
 
-    Producer(s) -> Node A -> Node B -> Node C -> Consumer(s)	                      
+    Producer(s) -> Node A -> Node B -> Node C -> Consumer(s)                          
 
 For Fanout, we might look like this:
 
-    		             		     -> Node C1 -> Consumer(s)
-               	                    |
-	Producer(s) -> Node A -> Node B ->  Node C2 -> Consumer(s)
-               	                    |
-			             			 -> Node C3 -> Consumer(s)
+                                        -> Node C1 -> Consumer(s)
+                                       |
+    Producer(s) -> Node A -> Node B ->  Node C2 -> Consumer(s)
+                                       |
+                                        -> Node C3 -> Consumer(s)
 
 
 Producers who need N-factor replication before returning success will write to Node A and get success response with the new assigned sequence number. The producer can then take that sequence number and poll a C node, waiting until C has committed or seen that sequence or higher. Once it gets back success, the client knows it's messages are N replica safe.
@@ -101,10 +114,10 @@ To increase message production capacity, multiple independent virtual shards (S1
 Example topology of a 3 shard, triple replicated queue using 3 physical node (A, B, C):
 
     Shard 1: Producer(s) -> Node A -> Node B -> Node C -> Consumer(s)
-	
+    
     Shard 2: Producer(s) -> Node B -> Node C -> Node A -> Consumer(s)
-	
-	Shard 3: Producer(s) -> Node C -> Node A -> Node B -> Consumer(s)
+    
+    Shard 3: Producer(s) -> Node C -> Node A -> Node B -> Consumer(s)
 
 Such a topology means casual ordering between shards is not possible.
 
@@ -121,22 +134,22 @@ Simply having the clients and remaining healthy nodes route around the unhealthy
 
 ###Master Takeover Table
 
-When machine topologies change, it's possible for replica's to have divergent update sequences. This can happen when an upstream replica is removed/crashed and is offline for a while, and it's added back in. It may have seen updates that the new write master hasn't seen. So we need to find the divergence point of the downstream replica and roll back updates to that point.
+When machine topologies change, it's possible for replica's to have divergent update sequences. This can happen when an upstream replica is removed/crashed and is offline for a while, a new write master is selected and the old master is to be added back in, but not as master. Old master  may have seen updates that the new write master hasn't seen (but no consumers have seen). So we need to find the divergence point of the downstream replica and roll back updates to that point.
 
 Using a failover table, which is a list of master writer identifiers (UUIDs) mapped to the sequence a node became the master, and is generated after each startup thereafter, recording the new UUID and current sequence number.
 
 This is failover table to for the first initialized master, it generates a UUID and adds it into the table at sequence 0:
 
     Master ID     | Takeover Seq
-	_____________________________
-	0xDEADBEEF... | 0
+    _____________________________
+    0xDEADBEEF... | 0
 
 Then 3000 messages are sent, and then the node restarted. On restart, it generates a new master UUID and adds the current high sequence to the takeover table:
 
     Master ID     | Takeover Seq
-	_____________________________
-	0xDEADBEEF... | 0
-	0xCAFEBABE... | 3000
+    _____________________________
+    0xDEADBEEF... | 0
+    0xCAFEBABE... | 3000
 
 
 So let's say we are a downstream replica node. As a downstream replica, when we connect to the upstream replica we retrieve the failover table from the compares it with our own, and find the common master ID between them. We will then rollback all changes to the sequence of the next newest entry, if it exists otherwise there is no sequence branch. If no common master is found, it completely resets it's storage.
@@ -153,9 +166,19 @@ If all the steps succeed, we are casually consistent with master and can start r
 
 ###Registered Consumers and High Water Marks
 
-To prevent messages from being deleted before all consumers have received them, each consumer registers a High Water Mark (HWM) record, that indicate the highest sequence the consumer has processed. When compacting the durable message store, any message lower than the 
+To prevent messages from being deleted before all consumers have received them, each consumer registers a named High Water Mark (HWM) record, that indicates the highest sequence the consumer, or group/class of consumers as successfully processed has processed. All high water mark message with a sequence number lower than the lowest high water mark may be elided, either during a compaction or simply when a consumer first starts receiving messages.
 
-###End to End Consistency Example
+At a minimum, a HWM needs to have
+1. Unique Consumer ID
+2. The sequence snapshot, seen.
+
+A consumer then asks us, a queue read node, to start sending changes from existing HWM record, by passing us consumer ID. If no record exists, the server returns a "no HWM" error.
+
+If the consumer expects an HWM but none exists, the means the queue has either been reset.
+
+3. Otherwise the queue read node sends a snapshot of all changes
+
+
 
 ###Storage Engine
 
@@ -170,7 +193,7 @@ Both Couchstore and ForestDB have unique properties directly suitable for a mess
 * MVCC snapshotting: The COW btree's and headers allow concurrent updates while any number of open snapshots operating on previous versions of the queue state, simplifying the correct operational behavior of consumers and producers without requiring locks. 
 * Pauseless compaction: When the storage file exceeds a garbage threshold, all live, unexpired data is copied into a new storage file, making all messages sequential and producing optimal locality and balancing of btrees. Current mutations copied until the compacted file is caught up with main file, which is then swapped out for the newly compacted file.
 
-The storage technology is uniquely designed for streaming and de-duplicating data and is battle proven at some of the largest, most heavily used websites.
+The storage technology is uniquely designed for streaming and de-duplicating d most heavily used websites.
 
 
 ##Conclusion
